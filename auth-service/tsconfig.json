@@ -1,0 +1,29 @@
+{
+	"compilerOptions": {
+		"module": "preserve",
+		"moduleResolution": "bundler",
+		"resolvePackageJsonExports": true,
+		"esModuleInterop": true,
+		"isolatedModules": true,
+		"declaration": true,
+		"removeComments": true,
+		"emitDecoratorMetadata": true,
+		"experimentalDecorators": true,
+		"allowSyntheticDefaultImports": true,
+		"target": "ES2024",
+		"sourceMap": true,
+		"outDir": "./dist",
+		"rootDir": ".",
+		"paths": {
+			"@prisma/generated": ["./prisma/generated"],
+			"@prisma/generated/*": ["./prisma/generated/*"]
+		},
+		"incremental": true,
+		"skipLibCheck": true,
+		"strict": true,
+		"strictNullChecks": false,
+		"strictPropertyInitialization": false,
+		"types": ["vitest/globals", "node"],
+		"resolveJsonModule": true
+	}
+}

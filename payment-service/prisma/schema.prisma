@@ -1,0 +1,101 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "./generated"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+
+model Payment{
+
+  id String @id @default(nanoid())
+
+  amount Float
+  status PaymentStatus @default(PENDING)
+
+  providerId String? @map("provider_id")
+  metadata Json?
+
+  userId String @map("user_id")
+  bookingId String @map("booking_id")
+
+  refounds Refound[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@map("payments")
+
+}
+
+model PaymentMethod {
+  
+  id String @id @default(nanoid())
+
+  type String
+  status PaymentMethodStatus @default(PENDING)
+
+  bank String?
+  brand String?
+
+  first6 String?
+  last4 String?
+
+  providerId String? @map("provider_id")
+
+  userId String @map("user_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@map("payment_methods")
+}
+
+model Refound {
+  id String @id @default(nanoid())
+
+  amount Float
+  status RefoundStatus @default(PENDING)  
+
+  providerId String? @map("provider_id")
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  paymentId String @map("payment_id")
+  
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@map("refounds")
+
+}
+
+enum PaymentStatus{
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+
+  @@map("payment_statuses")
+}
+
+enum PaymentMethodStatus {
+  PENDING
+  ACTIVE
+
+  @@map("payment_method_statuses")
+}
+
+enum RefoundStatus {
+  PENDING
+  SUCCESS
+  FAILED
+
+    @@map("refound_statuses")
+}

@@ -1,0 +1,2 @@
+CREATE DATABASE faramircinema_record_auth;
+CREATE DATABASE faramircinema_record_users;

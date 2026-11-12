@@ -1,0 +1,5 @@
+export * from './hall-client.grpc'
+export * from './movie-client.grpc'
+export * from './screening-client.grpc'
+export * from './seat-client.grpc'
+export * from './theater-client.grpc'
