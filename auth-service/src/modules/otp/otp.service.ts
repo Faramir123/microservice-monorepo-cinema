@@ -1,11 +1,13 @@
 import { RpcStatus } from '@faramircinema/common'
 import { Injectable } from '@nestjs/common'
 import { RpcException } from '@nestjs/microservices'
-import { createHash } from 'crypto'
+import { createHash, timingSafeEqual } from 'crypto'
 import { PinoLogger } from 'nestjs-pino'
 import { generateCode } from 'patcode'
 
 import { RedisService } from '../../infrastructure/redis/redis.service.js'
+
+const OTP_TTL_SECONDS = 300
 
 @Injectable()
 export class OtpService {
@@ -22,10 +24,10 @@ export class OtpService {
 		)
 
 		await this.redisService.set(
-			`otp:${type}:${identifier}`,
+			this.key(identifier, type),
 			hash,
 			'EX',
-			300
+			OTP_TTL_SECONDS
 		)
 
 		this.logger.info(
@@ -41,7 +43,7 @@ export class OtpService {
 		type: 'email' | 'phone'
 	) {
 		const storedHash = await this.redisService.get(
-			`otp:${type}:${identifier}`
+			this.key(identifier, type)
 		)
 
 		if (!storedHash) {
@@ -53,9 +55,7 @@ export class OtpService {
 			})
 		}
 
-		const incomingHash = createHash('sha256').update(code).digest('hex')
-
-		if (storedHash !== incomingHash) {
+		if (!this.hashesEqual(this.hashCode(code), storedHash)) {
 			this.logger.warn(`OTP verification failed for ${identifier}`)
 
 			throw new RpcException({
@@ -63,12 +63,59 @@ export class OtpService {
 				message: 'Invalid or expired OTP code'
 			})
 		}
-		await this.redisService.del(`otp:${type}:${identifier}`)
+		await this.redisService.del(this.key(identifier, type))
+	}
+
+	/**
+	 * Сравнивает plain-код с хэшем, сохранённым в pending_contract_changes.
+	 * Не бросает — возвращает boolean, чтобы AccountService сам мапил в RpcException.
+	 */
+	public verifyHash(plainCode: string, storedHash: string): boolean {
+		if (!storedHash) {
+			return false
+		}
+
+		const incomingHash = this.hashCode(plainCode)
+		return this.hashesEqual(incomingHash, storedHash)
+	}
+
+	/** Best-effort удаление OTP из Redis после успешного подтверждения. */
+	public async consume(
+		identifier: string,
+		type: 'email' | 'phone'
+	): Promise<void> {
+		await this.redisService.del(this.key(identifier, type))
+	}
+
+	private key(identifier: string, type: 'email' | 'phone') {
+		return `otp:${type}:${identifier}`
+	}
+
+	private hashCode(code: string): string {
+		return createHash('sha256').update(code).digest('hex')
+	}
+
+	private hashesEqual(a: string, b: string): boolean {
+		if (a.length !== b.length) {
+			return false
+		}
+
+		const bufA = Buffer.from(a, 'hex')
+		const bufB = Buffer.from(b, 'hex')
+
+		// Защита от невалидного hex (corrupted storedHash):
+		// Buffer.from(x, 'hex') молча возвращает меньше байт (вплоть до 0),
+		// а timingSafeEqual бросает RangeError при разной длине буферов.
+		if (bufA.length === 0 || bufA.length !== bufB.length) {
+			return false
+		}
+
+		return timingSafeEqual(bufA, bufB)
 	}
 
 	private generate() {
 		const code = generateCode()
-		const hash = createHash('sha256').update(code).digest('hex')
+		const hash = this.hashCode(code)
 
 		this.logger.info(`Generated OTP hash=${hash}`)
 

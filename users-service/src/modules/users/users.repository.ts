@@ -11,22 +11,33 @@ export class UsersRepository {
 		private readonly repository: Repository<UserEntity>
 	) {}
 
-	public findById(id: string) {
-		return this.repository.findOne({
-			where: {
-				id
-			}
-		})
+	public findById(id: string): Promise<UserEntity | null> {
+		return this.repository.findOne({ where: { id } })
 	}
 
-	public create(data: Partial<UserEntity>) {
-		const user = this.repository.create(data)
+	/**
+	 * Идемпотентный create: `INSERT … ON CONFLICT (id) DO NOTHING`.
+	 * Повторный вызов с существующим id не трогает ни одного поля
+	 */
+	public async create(
+		data: Pick<UserEntity, 'id'>
+	): Promise<UserEntity | null> {
+		await this.repository
+			.createQueryBuilder()
+			.insert()
+			.into(UserEntity)
+			.values(data)
+			.orIgnore()
+			.execute()
 
-		return this.repository.save(user)
+		return this.findById(data.id)
 	}
 
-	public update(id: string, data: Partial<UserEntity>) {
-		this.repository.update({ id }, data)
+	public async update(
+		id: string,
+		data: Partial<UserEntity>
+	): Promise<UserEntity | null> {
+		await this.repository.update({ id }, data)
 
 		return this.findById(id)
 	}

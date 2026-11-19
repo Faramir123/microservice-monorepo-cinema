@@ -1,226 +1,114 @@
 import { RpcStatus } from '@faramircinema/common'
-import type {
-	TelegramCompleteRequest,
-	TelegramConsumeRequest,
-	TelegramVerifyRequest
-} from '@faramircinema/contracts/gen/ts/auth.js'
 import { Injectable } from '@nestjs/common'
-import { ConfigService } from '@nestjs/config'
 import { RpcException } from '@nestjs/microservices'
-import { createHash, createHmac, randomBytes } from 'crypto'
+import { createHash, timingSafeEqual } from 'crypto'
+import { PinoLogger } from 'nestjs-pino'
+import { generateCode } from 'patcode'
 
-import { UserRepository } from '../../shared/repositories/user.repository.js'
-import { TokenService } from '../token/token.service.js'
-import { UsersClientGrpc } from '../users/users.grpc.js'
+import { RedisService } from '../../infrastructure/redis/redis.service.js'
 
-import { RedisService } from './../../infrastructure/redis/redis.service.js'
-import { TelegramRepository } from './telegram.repository.js'
+const OTP_TTL_SECONDS = 300
 
 @Injectable()
-export class TelegramService {
-	private readonly BOT_ID: string
-	private readonly BOT_TOKEN: string
-	private readonly BOT_USERNAME: string
-	private readonly REDIRECT_ORIGIN: string
-
+export class OtpService {
 	public constructor(
-		private readonly configService: ConfigService,
-		private readonly telegramRepository: TelegramRepository,
-		private readonly userRepository: UserRepository,
-		private readonly tokenService: TokenService,
-		private readonly redisService: RedisService,
-		private readonly usersClient: UsersClientGrpc
+		private readonly logger: PinoLogger,
+		private readonly redisService: RedisService
+	) {}
+
+	public async send(identifier: string, type: 'email' | 'phone') {
+		const { hash, code } = this.generate()
+
+		this.logger.info(
+			`Sending OTP code=${code} to identifier=${identifier}, type=${type}`
+		)
+
+		await this.redisService.set(
+			this.key(identifier, type),
+			hash,
+			'EX',
+			OTP_TTL_SECONDS
+		)
+
+		this.logger.info(
+			`OTP stored in Redis for identifier=${identifier}, type=${type}`
+		)
+
+		return { code, hash }
+	}
+
+	public async verify(
+		identifier: string,
+		code: string,
+		type: 'email' | 'phone'
 	) {
-		this.BOT_ID = this.configService.get<string>('telegram.botId', {
-			infer: true
-		})
-		this.BOT_TOKEN = this.configService.get<string>('telegram.botToken', {
-			infer: true
-		})
-		this.BOT_USERNAME = this.configService.get<string>(
-			'telegram.botUsername',
-			{
-				infer: true
-			}
-		)
-		this.REDIRECT_ORIGIN = this.configService.get<string>(
-			'telegram.redirectOrigin',
-			{
-				infer: true
-			}
-		)
-	}
-
-	public getAuthUrl() {
-		const url = new URL('https://oauth.telegram.org/auth')
-
-		url.searchParams.append('bot_id', this.BOT_ID)
-		url.searchParams.append('origin', this.REDIRECT_ORIGIN)
-		url.searchParams.append('request_access', 'write')
-		url.searchParams.append('return_to', this.REDIRECT_ORIGIN)
-
-		return { url: url.href }
-	}
-
-	public async verify(data: TelegramVerifyRequest) {
-		const isValid = this.checkTelegramAuth(data.query)
-
-		if (!isValid)
-			throw new RpcException({
-				code: RpcStatus.UNAUTHENTICATED,
-				details: 'Invalid Telegram signature'
-			})
-
-		// 2. Проверяем, что данные не устарели
-		const authDate = Number(data.query.auth_date)
-
-		// Текущее время в секундах (Unix timestamp)
-		const now = Math.floor(Date.now() / 1000)
-
-		// Разрешенный лимит (например, 5 минут = 300 секунд)
-		const MAX_AGE_SECONDS = 300
-
-		if (!authDate || isNaN(authDate)) {
-			throw new RpcException({
-				code: RpcStatus.INVALID_ARGUMENT,
-				details: 'Missing or invalid auth_date'
-			})
-		}
-
-		// Проверяем, не устарели ли данные
-		if (now - authDate > MAX_AGE_SECONDS) {
-			throw new RpcException({
-				code: RpcStatus.UNAUTHENTICATED,
-				details: 'Telegram auth data has expired'
-			})
-		}
-
-		// Проверяем, не пришли ли данные из будущего (защита от подмены времени)
-		if (authDate > now + 60) {
-			// допускаем расхождение часов в 1 минуту
-			throw new RpcException({
-				code: RpcStatus.INVALID_ARGUMENT,
-				details: 'Telegram auth_date is in the future'
-			})
-		}
-
-		const telegramId = data.query.id
-		const firstName = data.query.firstName
-		const lastName = data.query.lastName
-		const userName = data.query.username
-
-		const exists =
-			await this.telegramRepository.findByTelegramId(telegramId)
-
-		if (exists && exists.phone) {
-			if (
-				(!!exists.firstName && exists.firstName !== firstName) ||
-				(exists.lastName && exists.lastName !== lastName)
-			) {
-				await this.telegramRepository.update(exists.id, {
-					firstName,
-					lastName
-				})
-			}
-
-			return this.tokenService.generateTokens(exists.id)
-		}
-
-		this.usersClient.create({ id: exists.id }).subscribe()
-
-		const sessionId = randomBytes(16).toString('hex')
-
-		await this.redisService.set(
-			`telegram_session:${sessionId}`,
-			JSON.stringify({
-				telegramId,
-				userName,
-				firstName,
-				lastName
-			}),
-			'EX',
-			300
+		const storedHash = await this.redisService.get(
+			this.key(identifier, type)
 		)
 
-		return { url: `https://t.me/${this.BOT_USERNAME}?start=${sessionId}` }
-	}
+		if (!storedHash) {
+			this.logger.warn(`OTP expired or missing for ${identifier}`)
 
-	public async complete(data: TelegramCompleteRequest) {
-		const { sessionId, phone } = data
-
-		const raw = await this.redisService.get(`telegram_session:${sessionId}`)
-
-		if (!raw)
 			throw new RpcException({
 				code: RpcStatus.NOT_FOUND,
-				details: 'Session not found'
+				message: 'Invalid or expired OTP code'
 			})
+		}
 
-		const { telegramId } = JSON.parse(raw)
+		if (!this.hashesEqual(this.hashCode(code), storedHash)) {
+			this.logger.warn(`OTP verification failed for ${identifier}`)
 
-		let user = await this.userRepository.findByPhone(phone)
-
-		if (!user) user = await this.userRepository.createAccount({ phone })
-
-		await this.userRepository.update(user.id, {
-			telegramId,
-			isPhoneVerified: true
-		})
-
-		const tokens = this.tokenService.generateTokens(user.id)
-
-		await this.redisService.set(
-			`telegram_tokens:${sessionId}`,
-			JSON.stringify(tokens),
-			'EX',
-			120
-		)
-
-		await this.redisService.del(`telegram_session:${sessionId}`)
-
-		return { sessionId }
-	}
-
-	public async consumeSession(data: TelegramConsumeRequest) {
-		const { sessionId } = data
-
-		const raw = await this.redisService.get(`telegram_tokens:${sessionId}`)
-
-		if (!raw)
 			throw new RpcException({
 				code: RpcStatus.NOT_FOUND,
-				details: 'Session not found'
+				message: 'Invalid or expired OTP code'
 			})
-
-		const tokens = JSON.parse(raw)
-
-		await this.redisService.del(`telegram_tokens:${sessionId}`)
-
-		return tokens
+		}
+		await this.redisService.del(this.key(identifier, type))
 	}
 
-	private checkTelegramAuth(query: Record<string, string>) {
-		const hash = query.hash
+	/**
+	 * Сравнивает plain-код с хэшем, сохранённым в pending_contract_changes.
+	 * Не бросает — возвращает boolean, чтобы AccountService сам мапил в RpcException.
+	 */
+	public verifyHash(plainCode: string, storedHash: string): boolean {
+		if (!storedHash) {
+			return false
+		}
 
-		if (!hash) return false
+		const incomingHash = this.hashCode(plainCode)
+		return this.hashesEqual(incomingHash, storedHash)
+	}
 
-		const dataCheckArr = Object.keys(query)
-			.filter(k => k !== 'hash')
-			.sort()
-			.map(k => `${k}=${query[k]}`)
+	/** Best-effort удаление OTP из Redis после успешного подтверждения. */
+	public async consume(
+		identifier: string,
+		type: 'email' | 'phone'
+	): Promise<void> {
+		await this.redisService.del(this.key(identifier, type))
+	}
 
-		const dataCheckString = dataCheckArr.join('\n')
+	private key(identifier: string, type: 'email' | 'phone') {
+		return `otp:${type}:${identifier}`
+	}
 
-		const secretKey = createHash('sha256')
-			.update(`${this.BOT_ID}:${this.BOT_TOKEN}`)
-			.digest()
+	private hashCode(code: string): string {
+		return createHash('sha256').update(code).digest('hex')
+	}
 
-		const hmac = createHmac('sha256', secretKey)
-			.update(dataCheckString)
-			.digest('hex')
+	private hashesEqual(a: string, b: string): boolean {
+		// sha256-hex всегда 64 символа; при разной длине timingSafeEqual бросит
+		if (a.length !== b.length) {
+			return false
+		}
+		return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'))
+	}
 
-		const isValid = hmac === hash
+	private generate() {
+		const code = generateCode()
+		const hash = this.hashCode(code)
 
-		return isValid
+		this.logger.info(`Generated OTP hash=${hash}`)
+
+		return { hash, code }
 	}
 }

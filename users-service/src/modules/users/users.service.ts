@@ -47,7 +47,17 @@ export class UsersService {
 
 	public async create(data: CreateUserRequest) {
 		const { id } = data
-		return await this.usersRepository.create({ id })
+
+		const user = await this.usersRepository.create({ id })
+
+		if (!user) {
+			throw new RpcException({
+				code: RpcStatus.INTERNAL,
+				details: 'Failed to create user'
+			})
+		}
+
+		return user
 	}
 
 	public async patchUser(data: PatchUserRequest) {

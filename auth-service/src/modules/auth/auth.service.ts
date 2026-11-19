@@ -7,6 +7,7 @@ import type {
 import { Injectable } from '@nestjs/common'
 import { RpcException } from '@nestjs/microservices'
 import { PinoLogger } from 'nestjs-pino'
+import { lastValueFrom, timeout } from 'rxjs'
 
 import type { Account } from '../../../prisma/generated/client.js'
 import { MessagingService } from '../../infrastructure/messaging/messaging.service.js'
@@ -17,6 +18,8 @@ import { UsersClientGrpc } from '../users/users.grpc.js'
 
 @Injectable()
 export class AuthService {
+	private static readonly USERS_GRPC_TIMEOUT_MS = 5_000
+
 	public constructor(
 		private readonly logger: PinoLogger,
 		private readonly userRepository: UserRepository,
@@ -31,9 +34,7 @@ export class AuthService {
 	public async sendOtp(data: SendOtpRequest) {
 		const { identifier, type } = data
 
-		this.logger.info(
-			`OTP requst recived: indetifier=${identifier}, type=${type}`
-		)
+		this.logger.info({ identifier, type }, 'OTP request received')
 
 		let account: Account | null
 
@@ -45,7 +46,8 @@ export class AuthService {
 
 		if (!account) {
 			this.logger.info(
-				`Account not found for identifier=${identifier}, type=${type}. Creating new account.`
+				{ identifier, type },
+				'Account not found, creating new account'
 			)
 
 			account = await this.userRepository.createAccount({
@@ -59,17 +61,17 @@ export class AuthService {
 			type as 'email' | 'phone'
 		)
 
-		console.log('CODE:', code)
+		if (process.env.NODE_ENV !== 'production') {
+			this.logger.debug({ identifier }, 'OTP generated (dev-only log)')
+		}
 
 		await this.messagingService.otpRequested({
 			identifier,
 			type,
-			code: code
+			code
 		})
 
-		this.logger.info(
-			`OTP sent successfully for identifier=${identifier}, type=${type}`
-		)
+		this.logger.info({ identifier, type }, 'OTP sent successfully')
 
 		return { ok: true }
 	}
@@ -78,7 +80,8 @@ export class AuthService {
 		const { identifier, type, code } = data
 
 		this.logger.info(
-			`OTP verification request received: identifier=${identifier}, type=${type}`
+			{ identifier, type },
+			'OTP verification request received'
 		)
 
 		await this.otpService.verify(
@@ -97,9 +100,9 @@ export class AuthService {
 
 		if (!account) {
 			this.logger.warn(
-				`OTP verified but account not found: ${identifier}`
+				{ identifier, type },
+				'OTP verified but account not found'
 			)
-
 			throw new RpcException({
 				code: RpcStatus.NOT_FOUND,
 				message: 'Account not found'
@@ -118,9 +121,15 @@ export class AuthService {
 			})
 		}
 
-		this.logger.info(`OTP fevifird successfully for ${identifier}`)
+		this.logger.info(
+			{ accountId: account.id, identifier },
+			'OTP verified successfully'
+		)
 
-		this.usersClient.create({ id: account.id }).subscribe()
+		// create идемпотентен (ON CONFLICT DO NOTHING) —
+		// вызываем на каждый verifyOtp. Если в прошлый раз users-service
+		// лежал, досинхронизируемся здесь же.
+		await this.ensureUserProfile(account.id)
 
 		return this.tokenService.generateTokens(account.id)
 	}
@@ -128,13 +137,12 @@ export class AuthService {
 	public async refresh(data: RefreshRequest) {
 		const { refreshToken } = data
 
-		this.logger.info(`Refresh token requested`)
+		this.logger.info('Refresh token requested')
 
 		const result = this.tokenService.verify(refreshToken)
 
 		if (!result.valid) {
-			this.logger.warn(`Invalid refresh token: ${result.reason}`)
-
+			this.logger.warn({ reason: result.reason }, 'Invalid refresh token')
 			throw new RpcException({
 				code: RpcStatus.NOT_FOUND,
 				details: result.reason
@@ -142,9 +150,28 @@ export class AuthService {
 		}
 
 		this.logger.info(
-			`Refresh token verified successfully for userId=${result.userId}`
+			{ userId: result.userId },
+			'Refresh token verified successfully'
 		)
 
 		return this.tokenService.generateTokens(result.userId)
+	}
+
+	private async ensureUserProfile(accountId: string): Promise<void> {
+		try {
+			await lastValueFrom(
+				this.usersClient
+					.create({ id: accountId })
+					.pipe(timeout(AuthService.USERS_GRPC_TIMEOUT_MS))
+			)
+		} catch (error) {
+			this.logger.error(
+				{
+					accountId,
+					error: error instanceof Error ? error.message : error
+				},
+				'users-service CreateUser failed; will retry on next verifyOtp'
+			)
+		}
 	}
 }

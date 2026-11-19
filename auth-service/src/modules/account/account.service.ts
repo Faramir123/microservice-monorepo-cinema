@@ -17,6 +17,8 @@ import { UserRepository } from '../../shared/repositories/user.repository.js'
 import { OtpService } from './../otp/otp.service.js'
 import { AccountRepository } from './account.repository.js'
 
+const OTP_TTL_MS = 5 * 60 * 1000
+
 @Injectable()
 export class AccountService {
 	public constructor(
@@ -73,15 +75,17 @@ export class AccountService {
 
 		const { code, hash } = await this.otpService.send(email, 'email')
 
-		await this.messagingService.emailChanged({ email, code })
-
+		// 1) Сначала durable-состояние в БД
 		await this.accountRepository.upsertPendingChange({
 			accountId: userId,
 			type: 'email',
 			value: email,
 			codeHash: hash,
-			expiresAt: new Date(Date.now() + 5 * 60 * 1000)
+			expiresAt: new Date(Date.now() + OTP_TTL_MS)
 		})
+
+		// 2) Только после успешной записи — уведомление
+		await this.messagingService.emailChanged({ email, code })
 
 		this.logger.info(
 			`Email change initiated for userId=${userId}, email=${email}`
@@ -132,14 +136,28 @@ export class AccountService {
 				details: 'Code expired'
 			})
 		}
-		this.otpService.verify(pending.value, code, 'email')
 
-		await this.userRepository.update(userId, {
-			email,
-			isEmailVerified: true
-		})
+		const result = await this.accountRepository
+			.applyPendingChangeAndDelete({
+				accountId: userId,
+				type: 'email',
+				expectedValue: email, // то, что мы проверили как pending.value
+				userUpdate: { email, isEmailVerified: true }
+			})
+			.catch(err => this.throwMappedPrismaError(err, 'email'))
 
-		await this.accountRepository.deletePendingChange(userId, 'email')
+		if (result.status === 'pending_missing') {
+			// Кто-то (другой запрос или повторный init) уже сдвинул pending —
+			// наше подтверждение не применилось. Это или replay, или гонка.
+			this.logger.warn(
+				`Pending email change disappeared for userId=${userId}, email=${email}`
+			)
+			throw new RpcException({
+				code: RpcStatus.NOT_FOUND,
+				details: 'No pending request'
+			})
+		}
+
 		this.logger.info(
 			`Email change confirmed for userId=${userId}, email=${email}`
 		)
@@ -148,9 +166,11 @@ export class AccountService {
 
 	public async initPhoneChange(data: InitPhoneChangeRequest) {
 		const { phone, userId } = data
+
 		this.logger.info(
 			`Initiating phone change for userId=${userId}, phone=${phone}`
 		)
+
 		const existing = await this.userRepository.findByPhone(phone)
 
 		if (existing) {
@@ -160,17 +180,20 @@ export class AccountService {
 				details: 'Phone already in use'
 			})
 		}
+
 		const { code, hash } = await this.otpService.send(phone, 'phone')
 
-		await this.messagingService.phoneChanged({ phone, code })
-
+		// 1) Сначала durable-состояние в БД
 		await this.accountRepository.upsertPendingChange({
 			accountId: userId,
 			type: 'phone',
 			value: phone,
 			codeHash: hash,
-			expiresAt: new Date(Date.now() + 5 * 60 * 1000)
+			expiresAt: new Date(Date.now() + OTP_TTL_MS)
 		})
+
+		// 2) Только после успешной записи — уведомление
+		await this.messagingService.phoneChanged({ phone, code })
 
 		this.logger.info(
 			`Phone change initiated for userId=${userId}, phone=${phone}`
@@ -181,9 +204,11 @@ export class AccountService {
 
 	public async confirmPhoneChange(data: ConfirmPhoneChangeRequest) {
 		const { phone, code, userId } = data
+
 		this.logger.info(
 			`Confirming phone change for userId=${userId}, phone=${phone}`
 		)
+
 		const pending = await this.accountRepository.findPendingChange(
 			userId,
 			'phone'
@@ -198,6 +223,7 @@ export class AccountService {
 				details: 'No pending request'
 			})
 		}
+
 		if (pending.value !== phone) {
 			this.logger.warn(
 				`Phone mismatch for userId=${userId}: expected=${pending.value}, received=${phone}`
@@ -218,17 +244,56 @@ export class AccountService {
 			})
 		}
 
-		this.otpService.verify(pending.value, code, 'phone')
+		const result = await this.accountRepository
+			.applyPendingChangeAndDelete({
+				accountId: userId,
+				type: 'phone',
+				expectedValue: phone, // то, что мы проверили как pending.value
+				userUpdate: { phone, isPhoneVerified: true }
+			})
+			.catch(err => this.throwMappedPrismaError(err, 'phone'))
 
-		await this.userRepository.update(userId, {
-			phone,
-			isPhoneVerified: true
-		})
+		if (result.status === 'pending_missing') {
+			// Кто-то (другой запрос или повторный init) уже сдвинул pending —
+			// наше подтверждение не применилось. Это или replay, или гонка.
+			this.logger.warn(
+				`Pending phone change disappeared for userId=${userId}, phone=${phone}`
+			)
+			throw new RpcException({
+				code: RpcStatus.NOT_FOUND,
+				details: 'No pending request'
+			})
+		}
 
-		await this.accountRepository.deletePendingChange(userId, 'phone')
 		this.logger.info(
 			`Phone change confirmed for userId=${userId}, phone=${phone}`
 		)
 		return { ok: true }
+	}
+
+	private throwMappedPrismaError(
+		err: unknown,
+		field: 'email' | 'phone'
+	): never {
+		const code = (err as { code?: string } | null)?.code
+
+		if (code === 'P2025') {
+			throw new RpcException({
+				code: RpcStatus.NOT_FOUND,
+				details: 'Account not found'
+			})
+		}
+
+		if (code === 'P2002') {
+			throw new RpcException({
+				code: RpcStatus.ALREADY_EXISTS,
+				details:
+					field === 'email'
+						? 'Email already in use'
+						: 'Phone already in use'
+			})
+		}
+
+		throw err
 	}
 }
